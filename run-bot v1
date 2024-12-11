@@ -1,0 +1,51 @@
+from crypto_trading_bot import CryptoTradingBot
+from binance.client import Client
+import logging
+import time
+from requests.exceptions import RequestException
+from urllib3.exceptions import HTTPError
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Testnet API credentials
+API_KEY = ''
+API_SECRET = ''
+
+def main():
+    while True:
+        try:
+            # Initialize client with Testnet settings
+            client = Client(API_KEY, API_SECRET)
+            client.API_URL = 'https://testnet.binance.vision/api'
+
+            # Test connection
+            client.ping()
+            logging.info("Successfully connected to Binance Testnet")
+
+            bot = CryptoTradingBot(
+                api_key=API_KEY,
+                api_secret=API_SECRET,
+                lookback=35,
+                holding_days=14,
+                threshold=0.05,
+                number_of_tokens=5  # Reduced for testnet
+            )
+
+            bot.run()
+
+        except (RequestException, HTTPError) as e:
+            logging.error(f"Network error: {str(e)}")
+            time.sleep(60)  # Wait a minute before retrying
+        except Exception as e:
+            logging.error(f"Bot crashed with error: {str(e)}")
+            time.sleep(60)
+        except KeyboardInterrupt:
+            logging.info("Bot stopped by user")
+            break
+
+if __name__ == "__main__":
+    main() 
