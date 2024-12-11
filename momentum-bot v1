@@ -1,0 +1,261 @@
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+import pandas as pd
+import numpy as np
+from heapq import nlargest
+import time
+from datetime import datetime, timedelta
+import logging
+from requests.exceptions import RequestException
+from urllib3.exceptions import HTTPError
+import backoff  # You'll need to install this: pip install backoff
+
+class CryptoTradingBot:
+    def __init__(self, api_key, api_secret, lookback=35, holding_days=14, threshold=0.05, 
+                 number_of_tokens=10, commission=0.001):
+        self.client = Client(api_key, api_secret)
+        self.client.API_URL = 'https://testnet.binance.vision/api'  # Set Testnet URL
+        self.lookback = lookback
+        self.holding_days = holding_days
+        self.threshold = threshold
+        self.number_of_tokens = number_of_tokens
+        self.commission = commission
+        self.setup_logging()
+        
+    def setup_logging(self):
+        logging.basicConfig(
+            filename=f'trading_bot_{datetime.now().strftime("%Y%m%d")}.log',
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+    @backoff.on_exception(backoff.expo, 
+                         (RequestException, HTTPError, BinanceAPIException),
+                         max_tries=5)
+    def get_historical_data(self, symbol, interval='1d'):
+        try:
+            # Calculate the start time in milliseconds
+            lookback_days = self.lookback + self.holding_days + 1
+            start_time = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
+            
+            klines = self.client.get_historical_klines(
+                symbol, 
+                interval,
+                start_str=start_time,
+                limit=1000  # Add explicit limit
+            )
+            
+            if not klines:
+                logging.warning(f"No data returned for {symbol}")
+                return None
+                
+            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+                                             'close_time', 'quote_volume', 'trades', 'taker_buy_base', 
+                                             'taker_buy_quote', 'ignored'])
+            df['close'] = df['close'].astype(float)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return df['close']
+            
+        except BinanceAPIException as e:
+            logging.error(f"Binance API error for {symbol}: {str(e)}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error fetching data for {symbol}: {str(e)}")
+            return None
+
+    def information_discreteness(self, prices):
+        returns = prices.pct_change()
+        positive_returns = returns[returns > 0]
+        negative_returns = returns[returns < 0]
+        negative_positive_diff = negative_returns.count() / len(prices) - positive_returns.count() / len(prices)
+        cumul_return = prices[-1] / prices[0] - 1
+        sign = lambda x: 1 if x > 0 else -1 if x < 0 else 0
+        return sign(cumul_return) * negative_positive_diff
+
+    def get_top_tokens(self):
+        try:
+            # Get all USDT trading pairs
+            exchange_info = self.client.get_exchange_info()
+            usdt_pairs = [symbol['symbol'] for symbol in exchange_info['symbols'] 
+                         if symbol['symbol'].endswith('USDT') and symbol['status'] == 'TRADING']
+            
+            # Add delay to avoid rate limits
+            time.sleep(1)
+            
+            price_data = {}
+            btc_data = self.get_historical_data('BTCUSDT')
+            
+            if btc_data is None:
+                logging.error("Failed to fetch BTC data")
+                return []
+                
+            btc_return = btc_data[-1] / btc_data[-self.lookback] - 1
+            
+            if btc_return <= self.threshold:
+                logging.info(f"BTC return ({btc_return:.2%}) below threshold, holding BTC")
+                return []
+                
+            for symbol in usdt_pairs:
+                try:
+                    prices = self.get_historical_data(symbol)
+                    if prices is not None and len(prices) >= self.lookback:
+                        price_data[symbol] = prices
+                    time.sleep(0.1)  # Add small delay between requests
+                except Exception as e:
+                    logging.error(f"Error processing {symbol}: {str(e)}")
+                    continue
+            
+            return_ranks = {}
+            discreteness_ranks = {}
+            combined_ranks = {}
+            
+            for symbol, prices in price_data.items():
+                try:
+                    raw_return = prices[-1] / prices[-self.lookback] - 1
+                    token_discreteness = self.information_discreteness(prices)
+                    return_ranks[symbol] = raw_return
+                    discreteness_ranks[symbol] = token_discreteness
+                except Exception as e:
+                    logging.error(f"Error calculating metrics for {symbol}: {str(e)}")
+                    continue
+                
+            # Calculate combined rankings
+            returns_sorted = sorted(return_ranks.items(), key=lambda x: x[1], reverse=True)
+            discreteness_sorted = sorted(discreteness_ranks.items(), key=lambda x: x[1], reverse=True)
+            
+            for rank, (token, _) in enumerate(returns_sorted, 1):
+                combined_ranks[token] = rank
+            for rank, (token, _) in enumerate(discreteness_sorted, 1):
+                combined_ranks[token] = combined_ranks.get(token, 0) + rank
+            
+            return nlargest(self.number_of_tokens, combined_ranks.keys(), key=lambda x: -combined_ranks[x])
+        except Exception as e:
+            logging.error(f"Error in get_top_tokens: {str(e)}")
+            return []
+
+    def get_quantity_precision(self, symbol_info):
+        """Extract quantity precision from symbol info"""
+        try:
+            for filter in symbol_info['filters']:
+                if filter['filterType'] == 'LOT_SIZE':
+                    step_size = float(filter['stepSize'])
+                    precision = 0
+                    while step_size < 1:
+                        step_size *= 10
+                        precision += 1
+                    return precision
+            return 8  # Default precision if not found
+        except Exception as e:
+            logging.error(f"Error getting precision: {str(e)}")
+            return 8  # Default precision
+
+    def round_step_size(self, quantity, precision):
+        """Round quantity to the required step size"""
+        try:
+            return float('{:.{}f}'.format(quantity, precision))
+        except Exception as e:
+            logging.error(f"Error rounding quantity: {str(e)}")
+            return quantity
+
+    def execute_trades(self, selected_tokens):
+        try:
+            AMOUNT_PER_COIN = 100  # Fixed $100 per coin
+
+            # Get current holdings
+            account = self.client.get_account()
+            current_holdings = {asset['asset']: float(asset['free']) 
+                              for asset in account['balances'] if float(asset['free']) > 0}
+
+            # Sell tokens not in new selection
+            for asset, amount in current_holdings.items():
+                if asset != 'USDT' and f"{asset}USDT" not in selected_tokens:
+                    try:
+                        if amount > 0:
+                            symbol = f"{asset}USDT"
+                            # Get symbol info for precision
+                            symbol_info = self.client.get_symbol_info(symbol)
+                            if symbol_info is None:
+                                logging.error(f"Could not get symbol info for {symbol}")
+                                continue
+                            
+                            quantity_precision = self.get_quantity_precision(symbol_info)
+                            quantity = self.round_step_size(amount, quantity_precision)
+                            
+                            if quantity > 0:
+                                self.client.create_order(
+                                    symbol=symbol,
+                                    side='SELL',
+                                    type='MARKET',
+                                    quantity=quantity
+                                )
+                                logging.info(f"Sold {quantity} of {asset}")
+                    except Exception as e:
+                        logging.error(f"Error selling {asset}: {str(e)}")
+
+            # Buy new tokens
+            usdt_balance = float(self.client.get_asset_balance(asset='USDT')['free'])
+            
+            for symbol in selected_tokens:
+                try:
+                    # Get current price and symbol info
+                    price = float(self.client.get_symbol_ticker(symbol=symbol)['price'])
+                    symbol_info = self.client.get_symbol_info(symbol)
+                    
+                    if symbol_info is None:
+                        logging.error(f"Could not get symbol info for {symbol}")
+                        continue
+                    
+                    quantity_precision = self.get_quantity_precision(symbol_info)
+                    
+                    # Calculate quantity for $100 worth
+                    quantity = AMOUNT_PER_COIN / price
+                    quantity = self.round_step_size(quantity, quantity_precision)
+                    
+                    # Check minimum notional value
+                    min_notional = None
+                    for filter in symbol_info['filters']:
+                        if filter['filterType'] == 'MIN_NOTIONAL':
+                            min_notional = float(filter['minNotional'])
+                            break
+                    
+                    if min_notional and quantity * price < min_notional:
+                        logging.warning(f"Order for {symbol} below minimum notional value")
+                        continue
+                    
+                    if usdt_balance >= AMOUNT_PER_COIN and quantity > 0:
+                        self.client.create_order(
+                            symbol=symbol,
+                            side='BUY',
+                            type='MARKET',
+                            quantity=quantity
+                        )
+                        logging.info(f"Bought {quantity} of {symbol} at {price} USDT (${AMOUNT_PER_COIN} worth)")
+                        usdt_balance -= AMOUNT_PER_COIN
+                    else:
+                        logging.warning(f"Insufficient USDT balance for {symbol}")
+                        
+                except Exception as e:
+                    logging.error(f"Error buying {symbol}: {str(e)}")
+
+        except Exception as e:
+            logging.error(f"Error in execute_trades: {str(e)}")
+
+    def run(self):
+        while True:
+            try:
+                logging.info("Starting new trading cycle")
+                selected_tokens = self.get_top_tokens()
+                
+                if selected_tokens:
+                    logging.info(f"Selected tokens: {selected_tokens}")
+                    self.execute_trades(selected_tokens)
+                else:
+                    logging.info("No tokens selected, holding current position")
+                    
+                # Wait for holding period
+                time.sleep(self.holding_days * 24 * 60 * 60)
+                
+            except Exception as e:
+                logging.error(f"Error in main loop: {str(e)}")
+                time.sleep(300)  # Wait 5 minutes before retrying 
